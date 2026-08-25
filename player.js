@@ -1,25 +1,29 @@
 import fs from "fs";
 import readline from "readline";
-import * as AudioPkg from "audio";
+import path from "path";
+import mpv from "node-mpv";
 
-const path = "./songs";
-const songs = fs.readdirSync(path).filter((el) => el.endsWith(".mp3"));
+const songsFolder = "./songs";
+const songs = fs.readdirSync(songsFolder).filter((el) => el.endsWith(".mp3"));
 
 // Application State
 let selected = 0;
 let isPlaying = false;
-let progressTimer = null;
-
-// Audio State
 let currentTime = 0;
 let duration = 0;
-let audioPlayer = null; 
+
+// Initialize MPV Player
+const audioPlayer = new mpv({ audio_only: true });
+
+// Note: Some newer versions of node-mpv require manually starting the IPC socket
+if (typeof audioPlayer.start === "function") {
+  await audioPlayer.start();
+}
 
 // ==========================================
 // 1. Terminal UI & Rendering Logic
 // ==========================================
 function render() {
-  // Clear the terminal completely to prevent duplicate menus
   console.clear(); 
 
   const lines = [];
@@ -34,10 +38,14 @@ function render() {
   lines.push(`\n[↑/↓] Navigate  |  [Enter] Play  |  [Space] Pause/Resume  |  [q] Quit`);
   lines.push(`[←/→] Rewind/Fast-Forward 5s`);
 
-  if (audioPlayer && duration > 0) {
+  // Show progress bar if duration was successfully fetched
+  if (duration > 0 || isPlaying) {
     lines.push(`\n🎵 Now Playing: ${songs[selected].split(".")[0]}`);
     
-    const progress = Math.min(currentTime / duration, 1) || 0;
+    // Prevent dividing by zero if duration hasn't loaded yet
+    const safeDuration = duration > 0 ? duration : 1; 
+    const progress = Math.min(currentTime / safeDuration, 1) || 0;
+    
     const barSize = 30;
     const filled = Math.floor(progress * barSize);
     const bar = "█".repeat(filled) + "░".repeat(barSize - filled);
@@ -46,63 +54,61 @@ function render() {
     lines.push(`[${bar}] ${format(currentTime)} / ${format(duration)}`);
   }
 
-  // Print everything
   process.stdout.write(lines.join("\n") + "\n");
 }
 
 // ==========================================
-// 2. Audio Control using the `audio` package
+// 2. Audio Control & Status Polling
 // ==========================================
-function playSong(index) {
-  cleanUpCurrentSong();
-  const songPath = `${path}/${songs[index]}`;
-  
-  // Safely find the module whether it's wrapped in default or not
-  const Audio = AudioPkg.default || AudioPkg;
 
-  try {
-    if (typeof Audio.load === "function") {
-      Audio.load(songPath).then(setupAudio);
-    } else {
-      // Fallback for older/different package versions
-      const audioInstance = Audio(songPath);
-      setupAudio(audioInstance);
+// Fallback Polling: Forcefully ask MPV for the time and duration every second
+setInterval(async () => {
+  if (isPlaying) {
+    try {
+      const pos = await audioPlayer.getProperty("time-pos");
+      if (pos !== undefined) currentTime = pos;
+
+      if (!duration) {
+        const dur = await audioPlayer.getProperty("duration");
+        if (dur !== undefined) duration = dur;
+      }
+      render();
+    } catch (e) {
+      // Ignore background IPC polling errors while track switches
     }
+  }
+}, 1000);
+
+// Auto-cleanup when a song finishes
+audioPlayer.on('stopped', () => {
+  if (currentTime >= duration - 1 && duration > 0) {
+    isPlaying = false;
+    currentTime = 0;
+    duration = 0;
+    render();
+  }
+});
+
+async function playSong(index) {
+  // CRITICAL FIX: Give MPV the absolute path to your hard drive so it doesn't get lost
+  const songPath = path.resolve(songsFolder, songs[index]);
+  
+  try {
+    currentTime = 0;
+    duration = 0;
+    await audioPlayer.load(songPath);
+    isPlaying = true;
+    render();
   } catch (err) {
-    console.error("\nError loading audio file:", err);
+    console.error("\nPlayback error:", err);
   }
 }
 
-function setupAudio(audio) {
-  audioPlayer = audio;
-  audioPlayer.play();
-  
-  // Fallback to 180s if the buffer duration isn't instantly available
-  duration = audioPlayer.duration || 180; 
-  isPlaying = true;
-  
-  progressTimer = setInterval(() => {
-    if (isPlaying && audioPlayer) {
-      // Fetch real-time progress
-      currentTime = audioPlayer.currentTime || 0;
-      
-      if (currentTime >= duration) {
-        cleanUpCurrentSong(); 
-      }
-      render();
-    }
-  }, 1000);
-  
-  render();
-}
-
 function togglePause() {
-  if (!audioPlayer) return;
-  
   if (isPlaying) {
     audioPlayer.pause();
   } else {
-    audioPlayer.play();
+    audioPlayer.resume();
   }
   
   isPlaying = !isPlaying;
@@ -110,30 +116,16 @@ function togglePause() {
 }
 
 function skipTime(seconds) {
-  if (!audioPlayer) return;
-  
-  // Adjust the currentTime property directly
-  let newTime = Math.max(0, Math.min(audioPlayer.currentTime + seconds, duration));
-  audioPlayer.currentTime = newTime;
-  currentTime = newTime;
-  
+  // node-mpv handles relative seeking natively
+  audioPlayer.seek(seconds);
+  // Optimistically update the UI to prevent rendering lag
+  currentTime = Math.max(0, currentTime + seconds); 
   render();
 }
 
-function cleanUpCurrentSong() {
-  if (progressTimer) clearInterval(progressTimer);
-  if (audioPlayer) {
-    audioPlayer.pause(); 
-    audioPlayer = null;
-  }
-  isPlaying = false;
-  currentTime = 0;
-  duration = 0;
-}
-
 function exitApp() {
-  cleanUpCurrentSong();
-  process.stdout.write("\x1b[?25h"); // Restore terminal cursor
+  audioPlayer.quit(); 
+  process.stdout.write("\x1b[?25h"); 
   console.clear();
   process.exit(0);
 }
@@ -143,7 +135,7 @@ function exitApp() {
 // ==========================================
 readline.emitKeypressEvents(process.stdin);
 process.stdin.setRawMode(true);
-process.stdout.write("\x1b[?25l"); // Hide terminal cursor
+process.stdout.write("\x1b[?25l"); 
 
 process.stdin.on("keypress", (str, key) => {
   if (key.name === "q" || (key.ctrl && key.name === "c")) {
